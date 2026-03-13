@@ -27,7 +27,7 @@ build:
 
 # Run the project
 run:
-	python src/main.py
+	uv run python src/main.py
 
 # Shortcut for development (developer run)
 drun: format lint run

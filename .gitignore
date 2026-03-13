@@ -6,6 +6,7 @@ __pycache__
 account_statements/*
 data/*
 export/*
+data.csv
 
 # Development folder
 dev/
@@ -15,6 +16,12 @@ dev/
 
 # Python virtual environment
 *py*env*/
+
+# OS files
+.DS_Store
+
+# Notebooks
+*.ipynb
 
 !.gitkeep
 
