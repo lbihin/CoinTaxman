@@ -196,7 +196,7 @@ class BalanceQueue(abc.ABC):
         assert op.coin == self.coin
         sold_coins, unsold_change = self._remove(op.change)
 
-        if unsold_change:
+        if unsold_change > 0:
             # Queue ran out of items to sell and not all coins could be sold.
             msg = (
                 f"Not enough {op.coin} in queue to sell: "

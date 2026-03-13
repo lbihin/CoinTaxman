@@ -582,7 +582,7 @@ class PriceData:
         if (price := get_price_db(platform, coin, reference_coin, utc_time)) is None:
             # Price doesn't exists. Fetch price from platform.
             try:
-                get_price = getattr(self, f"_get_price_{platform}")
+                get_price = getattr(self, f"_get_price_{platform.lower()}")
             except AttributeError:
                 raise NotImplementedError(f"Unable to read data from {platform=}")
 

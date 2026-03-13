@@ -67,6 +67,10 @@ def xdecimal(
     if isinstance(x, (int, float)):
         x = str(x)
     assert x is None or isinstance(x, str) or isinstance(x, decimal.Decimal)
+    if isinstance(x, str):
+        # Replace comma with dot, so that decimal.Decimal can parse it.
+        # This is necessary for german locale, where the decimal separator is a comma.
+        x = x.replace(",", ".")
     return None if x is None or x == "" else decimal.Decimal(x)
 
 

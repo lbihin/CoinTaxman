@@ -239,6 +239,7 @@ class Book:
                         account in ("Spot", "Funding")
                         and operation == "Transfer Between Main and Funding Wallet"
                     )
+                    or operation == "Asset - Transfer"
                 ):
                     # Ignore transfers
                     continue
@@ -1282,11 +1283,11 @@ class Book:
                 # Parse data.
                 try:
                     utc_time = datetime.datetime.strptime(
-                        _timestamp, "%m/%d/%Y %H:%M:%S"
+                        _timestamp, "%Y-%m-%dT%H:%M:%S UTC"
                     )
                 except ValueError:
                     utc_time = datetime.datetime.strptime(
-                        _timestamp, "%m/%d/%Y %H:%M:%S.%f"
+                        _timestamp, "%m-%d-%Y %H:%M:%S.%f"
                     )
                 utc_time = utc_time.replace(tzinfo=datetime.timezone.utc)
                 buy_quantity = misc.xdecimal(_buy_quantity)
@@ -1519,7 +1520,7 @@ class Book:
                     "Fee Asset",
                     "Fee Value in EUR",
                     "Wallet",
-                    "Timestamp UTC",
+                    "Timestamp",
                     "Note",
                 ],
             }
