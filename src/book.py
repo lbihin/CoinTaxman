@@ -21,7 +21,7 @@ import decimal
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, NamedTuple, Optional, cast
 
 import openpyxl
 
@@ -36,6 +36,14 @@ from price_data import PriceData
 log = log_config.getLogger(__name__)
 
 
+class MissingOperation(NamedTuple):
+    platform: str
+    operation: str
+
+    def repr(self) -> str:
+        return f"- {self.platform}: {self.operation}"
+
+
 class Book:
     # Need to track state of duplicate deposit/withdrawal entries
     # All deposits/withdrawals are held back until they occur a second time
@@ -48,11 +56,12 @@ class Book:
         self.price_data = price_data
 
         self.operations: list[tr.Operation] = []
+        self._missing_operation_mappings: set[MissingOperation] = set()
 
     def __bool__(self) -> bool:
         return bool(self.operations)
 
-    def create_operation(
+    def _create_operation(
         self,
         operation: str,
         utc_time: datetime.datetime,
@@ -62,7 +71,7 @@ class Book:
         row: int,
         file_path: Path,
         remark: Optional[str] = None,
-    ) -> tr.Operation:
+    ) -> Optional[tr.Operation]:
 
         try:
             Op = getattr(tr, operation)
@@ -73,7 +82,8 @@ class Book:
                 "The operation type might have been removed or renamed. "
                 "Please open an issue or PR."
             )
-            raise RuntimeError
+            self._missing_operation_mappings.add(MissingOperation(platform, operation))
+            return None
 
         kwargs = {}
         if remark:
@@ -106,7 +116,7 @@ class Book:
         # Discard operations after the `TAX_YEAR`.
         # Ignore operations which make no change.
         if utc_time.year <= config.TAX_YEAR and change != 0:
-            op = self.create_operation(
+            op = self._create_operation(
                 operation,
                 utc_time,
                 platform,
@@ -117,7 +127,8 @@ class Book:
                 remark=remark,
             )
 
-            self._append_operation(op)
+            if op is not None:
+                self._append_operation(op)
 
     def _read_binance(self, file_path: Path, version: int = 1) -> None:
         platform = "binance"
@@ -131,6 +142,9 @@ class Book:
             "Crypto Box": "Airdrop",
             "Launchpool Airdrop": "Airdrop",
             "Megadrop Rewards": "Airdrop",
+            "HODLer Airdrops Distribution": "Airdrop",
+            "Token Swap - Distribution": "Airdrop",
+            "Launchpool Airdrop - System Distribution": "Airdrop",
             #
             "Savings Interest": "CoinLendInterest",
             "Savings purchase": "CoinLend",
@@ -811,18 +825,25 @@ class Book:
                 # == True: Operation has already been appended, this should not happen
                 if operation in ["Deposit", "Withdrawal"]:
                     # First, create the operations
-                    op = self.create_operation(
+                    op = self._create_operation(
                         operation, utc_time, platform, change, coin, row, file_path
                     )
                     op_fee = None
                     if fee != 0:
-                        op_fee = self.create_operation(
+                        op_fee = self._create_operation(
                             "Fee", utc_time, platform, fee, coin, row, file_path
                         )
+                    if (op is None) or (fee != 0 and op_fee is None):
+                        # Ignore on this run - operation could not be created
+                        # This might lead to unexpected errors while parsing the
+                        # rest of the file...
+                        # It'll be fixed, when the _missing_operation_mappings
+                        # aren't missing.
+                        pass
                     # If this is the first occurrence, set the "appended" flag to false
                     # and don't append the operation to the list. Instead, store the
                     # data for verifying or appending it later.
-                    if self.kraken_held_ops[refid]["appended"] is None:
+                    elif self.kraken_held_ops[refid]["appended"] is None:
                         self.kraken_held_ops[refid]["appended"] = False
                         self.kraken_held_ops[refid]["operation"] = op
                         self.kraken_held_ops[refid]["operation_fee"] = op_fee
@@ -1288,46 +1309,45 @@ class Book:
                 # Parse data.
                 try:
                     utc_time = datetime.datetime.strptime(
-                        _timestamp, "%Y-%m-%dT%H:%M:%S UTC"
+                        _timestamp, "%m/%d/%Y %H:%M:%S"
                     )
                 except ValueError:
                     utc_time = datetime.datetime.strptime(
-                        _timestamp, "%m-%d-%Y %H:%M:%S.%f"
+                        _timestamp, "%m/%d/%Y %H:%M:%S.%f"
                     )
                 utc_time = utc_time.replace(tzinfo=datetime.timezone.utc)
-                operation_type_s = str(operation_type)
-
-                buy_quantity = misc.xdecimal(cast(Any, _buy_quantity))
-                buy_value_in_fiat = misc.xdecimal(cast(Any, _buy_value_in_fiat))
-                sell_quantity = misc.xdecimal(cast(Any, _sell_quantity))
-                sell_value_in_fiat = misc.xdecimal(cast(Any, _sell_value_in_fiat))
-                fee_quantity = misc.xdecimal(cast(Any, _fee_quantity))
-                fee_value_in_fiat = misc.xdecimal(cast(Any, _fee_value_in_fiat))
+                buy_quantity = misc.xdecimal(_buy_quantity)
+                buy_value_in_fiat = misc.xdecimal(_buy_value_in_fiat)
+                sell_quantity = misc.xdecimal(_sell_quantity)
+                sell_value_in_fiat = misc.xdecimal(_sell_value_in_fiat)
+                fee_quantity = misc.xdecimal(_fee_quantity)
+                fee_value_in_fiat = misc.xdecimal(_fee_value_in_fiat)
 
                 # ... and define which operation to add.
                 add_operations: list[
                     tuple[str, decimal.Decimal, str, Optional[decimal.Decimal]]
                 ] = []
-                is_trade_like = operation_type in ("Trade", "Spend")
+                if operation_type != "Withdrawal":
+                    assert buy_quantity
+                    assert buy_asset
 
-                if operation_type != "Withdrawal" and buy_quantity and buy_asset:
-                    op = "Buy" if is_trade_like else operation_type
+                    op = "Buy" if operation_type == "Trade" else operation_type
                     add_operations.append(
                         (op, buy_quantity, buy_asset, buy_value_in_fiat)
                     )
 
-                if (
-                    operation_type not in ("Deposit", "Airdrop")
-                    and sell_quantity
-                    and sell_asset
-                ):
-                    op = "Sell" if is_trade_like else operation_type
+                if operation_type not in ("Deposit", "Airdrop"):
+                    assert sell_quantity
+                    assert sell_asset
+
+                    op = "Sell" if operation_type == "Trade" else operation_type
                     add_operations.append(
                         (op, sell_quantity, sell_asset, sell_value_in_fiat)
                     )
 
                 if fee_asset:
                     assert fee_quantity
+                    assert fee_value_in_fiat
 
                     add_operations.append(
                         ("Fee", fee_quantity, fee_asset, fee_value_in_fiat)
@@ -1722,7 +1742,7 @@ class Book:
                     "Fee Asset",
                     "Fee Value in EUR",
                     "Wallet",
-                    "Timestamp",
+                    "Timestamp UTC",
                     "Note",
                 ],
             }
@@ -2147,4 +2167,13 @@ class Book:
             log.warning("Unable to import any data.")
             return False
 
+        if self._missing_operation_mappings:
+            raise RuntimeError(
+                "Some operations couldn't been mapped. "
+                "Please adjust the operational mapping "
+                "for the following exchanges/operations:\n"
+                + "\n".join(
+                    sorted(map(MissingOperation.repr, self._missing_operation_mappings))
+                )
+            )
         return True
