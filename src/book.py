@@ -21,7 +21,9 @@ import decimal
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
+
+import openpyxl
 
 import config
 import log_config
@@ -1290,38 +1292,39 @@ class Book:
                         _timestamp, "%m-%d-%Y %H:%M:%S.%f"
                     )
                 utc_time = utc_time.replace(tzinfo=datetime.timezone.utc)
-                buy_quantity = misc.xdecimal(_buy_quantity)
-                buy_value_in_fiat = misc.xdecimal(_buy_value_in_fiat)
-                sell_quantity = misc.xdecimal(_sell_quantity)
-                sell_value_in_fiat = misc.xdecimal(_sell_value_in_fiat)
-                fee_quantity = misc.xdecimal(_fee_quantity)
-                fee_value_in_fiat = misc.xdecimal(_fee_value_in_fiat)
+                operation_type_s = str(operation_type)
+
+                buy_quantity = misc.xdecimal(cast(Any, _buy_quantity))
+                buy_value_in_fiat = misc.xdecimal(cast(Any, _buy_value_in_fiat))
+                sell_quantity = misc.xdecimal(cast(Any, _sell_quantity))
+                sell_value_in_fiat = misc.xdecimal(cast(Any, _sell_value_in_fiat))
+                fee_quantity = misc.xdecimal(cast(Any, _fee_quantity))
+                fee_value_in_fiat = misc.xdecimal(cast(Any, _fee_value_in_fiat))
 
                 # ... and define which operation to add.
                 add_operations: list[
                     tuple[str, decimal.Decimal, str, Optional[decimal.Decimal]]
                 ] = []
-                if operation_type != "Withdrawal":
-                    assert buy_quantity
-                    assert buy_asset
+                is_trade_like = operation_type in ("Trade", "Spend")
 
-                    op = "Buy" if operation_type == "Trade" else operation_type
+                if operation_type != "Withdrawal" and buy_quantity and buy_asset:
+                    op = "Buy" if is_trade_like else operation_type
                     add_operations.append(
                         (op, buy_quantity, buy_asset, buy_value_in_fiat)
                     )
 
-                if operation_type not in ("Deposit", "Airdrop"):
-                    assert sell_quantity
-                    assert sell_asset
-
-                    op = "Sell" if operation_type == "Trade" else operation_type
+                if (
+                    operation_type not in ("Deposit", "Airdrop")
+                    and sell_quantity
+                    and sell_asset
+                ):
+                    op = "Sell" if is_trade_like else operation_type
                     add_operations.append(
                         (op, sell_quantity, sell_asset, sell_value_in_fiat)
                     )
 
                 if fee_asset:
                     assert fee_quantity
-                    assert fee_value_in_fiat
 
                     add_operations.append(
                         ("Fee", fee_quantity, fee_asset, fee_value_in_fiat)
@@ -1348,6 +1351,173 @@ class Book:
                         )
                         set_price_db(
                             platform,
+                            coin,
+                            fiat,
+                            utc_time,
+                            price,
+                            overwrite=True,
+                        )
+
+    def _read_custom_eur_xlsx(self, file_path: Path) -> None:
+        fiat = "EUR"
+        expected_header = [
+            "Type",
+            "Buy Quantity",
+            "Buy Asset",
+            "Buy Value in EUR",
+            "Sell Quantity",
+            "Sell Asset",
+            "Sell Value in EUR",
+            "Fee Quantity",
+            "Fee Asset",
+            "Fee Value in EUR",
+            "Wallet",
+            "Timestamp",
+            "Note",
+        ]
+
+        workbook = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+
+        # BittyTax exports the same Binance data across multiple sheets:
+        #   "Binance S" (spot): all operations, but per-fill amounts are
+        #       scrambled for trades (wrong BTC↔crypto associations).
+        #   "Binance T" (trade): trades only, with correct per-fill data.
+        #   "Binance D,W": deposits and withdrawals only.
+        # When both S and T exist, we skip trade rows from S (since T is
+        # authoritative) and keep simple full-row dedup for non-trade
+        # operations that may appear on multiple sheets.
+        sheet_names = [ws.title for ws in workbook.worksheets]
+        has_trade_sheet = any(n.endswith(" T") for n in sheet_names)
+
+        seen_rows: set[tuple[Any, ...]] = set()
+
+        for sheet in workbook.worksheets:
+            is_spot_sheet = sheet.title.endswith(" S")
+            skip_trades = has_trade_sheet and is_spot_sheet
+
+            header_row = None
+            for row_index, row in enumerate(sheet.iter_rows(min_row=1, max_col=13), 1):
+                row_values = [cell.value for cell in row]
+                if row_values == expected_header:
+                    header_row = row_index
+                    break
+
+            if header_row is None:
+                continue
+
+            for row_index, row in enumerate(
+                sheet.iter_rows(min_row=header_row + 1, max_col=13),
+                header_row + 1,
+            ):
+                values = [cell.value for cell in row]
+                if not any(v is not None and str(v).strip() for v in values):
+                    continue
+
+                op_type = str(values[0]) if values[0] else ""
+
+                # Skip trade rows from the Spot sheet when a dedicated
+                # Trade sheet is present (avoids double-import of fills
+                # that differ only in scrambled per-fill amounts or ±1s
+                # timestamp drift).
+                if skip_trades and op_type in ("Trade", "Spend"):
+                    continue
+
+                # Simple full-row dedup for non-trade operations
+                # (e.g. deposits appearing on both D,W and S sheets).
+                row_key = tuple(values)
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+
+                (
+                    operation_type,
+                    _buy_quantity,
+                    buy_asset,
+                    _buy_value_in_fiat,
+                    _sell_quantity,
+                    sell_asset,
+                    _sell_value_in_fiat,
+                    _fee_quantity,
+                    fee_asset,
+                    _fee_value_in_fiat,
+                    platform,
+                    _timestamp,
+                    remark,
+                ) = values
+
+                # Skip rows that don't carry operation data.
+                if not operation_type:
+                    continue
+
+                if isinstance(_timestamp, datetime.datetime):
+                    utc_time = _timestamp.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    # Support string timestamps from converted spreadsheets.
+                    _timestamp_s = str(_timestamp)
+                    try:
+                        utc_time = datetime.datetime.strptime(
+                            _timestamp_s, "%Y-%m-%dT%H:%M:%S UTC"
+                        )
+                    except ValueError:
+                        utc_time = datetime.datetime.strptime(
+                            _timestamp_s, "%m-%d-%Y %H:%M:%S.%f"
+                        )
+                    utc_time = utc_time.replace(tzinfo=datetime.timezone.utc)
+
+                operation_type_s = str(operation_type)
+
+                buy_quantity = misc.xdecimal(cast(Any, _buy_quantity))
+                buy_value_in_fiat = misc.xdecimal(cast(Any, _buy_value_in_fiat))
+                sell_quantity = misc.xdecimal(cast(Any, _sell_quantity))
+                sell_value_in_fiat = misc.xdecimal(cast(Any, _sell_value_in_fiat))
+                fee_quantity = misc.xdecimal(cast(Any, _fee_quantity))
+                fee_value_in_fiat = misc.xdecimal(cast(Any, _fee_value_in_fiat))
+
+                add_operations: list[
+                    tuple[str, decimal.Decimal, str, Optional[decimal.Decimal]]
+                ] = []
+                is_trade_like = operation_type_s in ("Trade", "Spend")
+                if operation_type_s != "Withdrawal" and buy_quantity and buy_asset:
+                    op = "Buy" if is_trade_like else operation_type_s
+                    add_operations.append(
+                        (op, buy_quantity, str(buy_asset), buy_value_in_fiat)
+                    )
+
+                if (
+                    operation_type_s not in ("Deposit", "Airdrop")
+                    and sell_quantity
+                    and sell_asset
+                ):
+                    op = "Sell" if is_trade_like else operation_type_s
+                    add_operations.append(
+                        (op, sell_quantity, str(sell_asset), sell_value_in_fiat)
+                    )
+
+                if fee_asset:
+                    assert fee_quantity
+
+                    add_operations.append(
+                        ("Fee", fee_quantity, str(fee_asset), fee_value_in_fiat)
+                    )
+
+                platform_s = str(platform) if platform else ""
+                remark_s = str(remark) if remark else ""
+
+                for operation, change, coin, change_in_fiat in add_operations:
+                    self.append_operation(
+                        operation,
+                        utc_time,
+                        platform_s,
+                        change,
+                        coin,
+                        row_index,
+                        file_path,
+                        remark=remark_s,
+                    )
+                    if change_in_fiat and coin != fiat:
+                        price = change_in_fiat / change
+                        set_price_db(
+                            platform_s,
                             coin,
                             fiat,
                             utc_time,
@@ -1536,6 +1706,39 @@ class Book:
                             return exchange
                     # rewind the file after each header check
                     f.seek(0)
+
+        if file_path.suffix == ".xlsx":
+            expected = [
+                "Type",
+                "Buy Quantity",
+                "Buy Asset",
+                "Buy Value in EUR",
+                "Sell Quantity",
+                "Sell Asset",
+                "Sell Value in EUR",
+                "Fee Quantity",
+                "Fee Asset",
+                "Fee Value in EUR",
+                "Wallet",
+                "Timestamp",
+                "Note",
+            ]
+            try:
+                workbook = openpyxl.load_workbook(
+                    file_path, data_only=True, read_only=True
+                )
+            except Exception:
+                return None
+
+            for sheet in workbook.worksheets:
+                try:
+                    first_row = [
+                        c.value for c in next(sheet.iter_rows(min_row=1, max_col=13))
+                    ]
+                except StopIteration:
+                    continue
+                if first_row == expected:
+                    return "custom_eur_xlsx"
 
         return None
 
@@ -1875,7 +2078,11 @@ class Book:
             for file_path in statements_dir.iterdir():
                 # Ignore .gitkeep and temporary excel files.
                 filename = file_path.stem
-                if filename == ".gitkeep" or filename.startswith("~$"):
+                if (
+                    filename == ".gitkeep"
+                    or filename.startswith("~$")
+                    or file_path.name.startswith(".")
+                ):
                     continue
 
                 file_paths.append(file_path)

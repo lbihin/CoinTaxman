@@ -9,6 +9,7 @@ dependencies = [
     "requests>=2.32.4",
     "xlsxwriter>=3.0.3",
     "tzdata>=2022.1",
+    "openpyxl>=3.1.5",
 ]
 
 [dependency-groups]
