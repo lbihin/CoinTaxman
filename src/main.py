@@ -63,11 +63,8 @@ def main() -> None:
     # Save log
     log_file_path = evaluation_file_path.with_suffix(".log")
     log_config.shutdown()
-    if os.path.exists(TMP_LOG_FILEPATH):
-        os.rename(TMP_LOG_FILEPATH, log_file_path)
-        print(f"Detailed export saved at {evaluation_file_path} and {log_file_path}")
-    else:
-        print(f"Detailed export saved at {evaluation_file_path}")
+    os.rename(TMP_LOG_FILEPATH, log_file_path)
+    print(f"Detailed export saved at {evaluation_file_path} and {log_file_path}")
     if EXPORT_WISO_CSV:
         print(f"WISO CSV saved at {wiso_csv_path}")
     print("If you want to archive the evaluation, run `make archive`.")

@@ -21,7 +21,7 @@ import decimal
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, cast
+from typing import Any, Optional, NamedTuple, cast
 
 import openpyxl
 
