@@ -241,10 +241,13 @@ class Book:
                         account in ("Spot", "Funding")
                         and operation == "Transfer Between Main and Funding Wallet"
                     )
-                    or operation == "Asset - Transfer"
                 ):
-                    # Ignore transfers
+                    # Ignore internal transfers
                     continue
+
+                if operation == "Asset - Transfer":
+                    # ONG gas distributions, token migrations, etc.
+                    operation = "Airdrop" if change > 0 else "Sell"
 
                 change = abs(change)
 
@@ -1379,21 +1382,38 @@ class Book:
         workbook = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
 
         # BittyTax exports the same Binance data across multiple sheets:
-        #   "Binance S" (spot): all operations, but per-fill amounts are
-        #       scrambled for trades (wrong BTC↔crypto associations).
-        #   "Binance T" (trade): trades only, with correct per-fill data.
+        #   "Binance S" (spot): all operations, but per-fill BTC amounts
+        #       are scrambled for BTC-pair trades.  Also contains non-BTC
+        #       trades (e.g. dust conversions to BNB) that do NOT appear
+        #       on the Trade sheet.
+        #   "Binance T" (trade): exchange trades only, correct per-fill
+        #       data.  Covers BTC-pair trades and a few non-BTC trades.
         #   "Binance D,W": deposits and withdrawals only.
-        # When both S and T exist, we skip trade rows from S (since T is
-        # authoritative) and keep simple full-row dedup for non-trade
-        # operations that may appear on multiple sheets.
+        # Strategy: process T first (all rows kept, including genuine
+        # identical fills).  On S, skip BTC trades (duplicated on T with
+        # scrambled data).  Non-BTC trades and non-trade operations use
+        # a counter to handle cross-sheet overlaps without collapsing
+        # genuine identical fills within the same sheet.
         sheet_names = [ws.title for ws in workbook.worksheets]
         has_trade_sheet = any(n.endswith(" T") for n in sheet_names)
 
-        seen_rows: set[tuple[Any, ...]] = set()
+        # Counter-based dedup: tracks how many copies of each row have
+        # been seen.  A later sheet can match up to that many copies
+        # without losing genuine fills within a single sheet.
+        from collections import Counter
 
-        for sheet in workbook.worksheets:
+        row_counter: Counter[tuple[Any, ...]] = Counter()
+
+        # Process Trade sheet before Spot so that row_counter is
+        # populated when we encounter overlapping rows on S.
+        sheets_ordered = sorted(
+            workbook.worksheets,
+            key=lambda s: (0 if s.title.endswith(" T") else 1),
+        )
+
+        for sheet in sheets_ordered:
             is_spot_sheet = sheet.title.endswith(" S")
-            skip_trades = has_trade_sheet and is_spot_sheet
+            is_trade_sheet = sheet.title.endswith(" T")
 
             header_row = None
             for row_index, row in enumerate(sheet.iter_rows(min_row=1, max_col=13), 1):
@@ -1415,19 +1435,31 @@ class Book:
 
                 op_type = str(values[0]) if values[0] else ""
 
-                # Skip trade rows from the Spot sheet when a dedicated
-                # Trade sheet is present (avoids double-import of fills
-                # that differ only in scrambled per-fill amounts or ±1s
-                # timestamp drift).
-                if skip_trades and op_type in ("Trade", "Spend"):
-                    continue
+                # On the Spot sheet, skip BTC-pair trades when a Trade
+                # sheet exists: these are duplicated with scrambled
+                # per-fill amounts.  Non-BTC trades (dust conversions
+                # to BNB, etc.) are kept because they only appear on S.
+                if is_spot_sheet and has_trade_sheet and op_type in ("Trade", "Spend"):
+                    buy_asset_s = str(values[2]) if values[2] else ""
+                    sell_asset_s = str(values[5]) if values[5] else ""
+                    if buy_asset_s == "BTC" or sell_asset_s == "BTC":
+                        continue
 
-                # Simple full-row dedup for non-trade operations
-                # (e.g. deposits appearing on both D,W and S sheets).
                 row_key = tuple(values)
-                if row_key in seen_rows:
-                    continue
-                seen_rows.add(row_key)
+
+                if is_trade_sheet:
+                    # T is authoritative: import every row (including
+                    # genuine identical fills) and record in counter.
+                    row_counter[row_key] += 1
+                else:
+                    # For S and D,W: skip rows already accounted for
+                    # on a previously processed sheet, decrementing
+                    # the counter so genuine duplicates on THIS sheet
+                    # are still imported.
+                    if row_counter[row_key] > 0:
+                        row_counter[row_key] -= 1
+                        continue
+                    row_counter[row_key] += 1
 
                 (
                     operation_type,
@@ -2023,7 +2055,12 @@ class Book:
                         assert isinstance(sell_op, tr.Sell)
                         assert sell_op.link is None
                         assert sell_op.selling_value is None
-                        percent = buying_cost / buy_op.buying_cost
+                        if buy_op.buying_cost:
+                            percent = buying_cost / buy_op.buying_cost
+                        else:
+                            percent = decimal.Decimal(1) / decimal.Decimal(
+                                len(sell_ops)
+                            )
                         sell_op.selling_value = self.price_data.get_partial_cost(
                             buy_op, percent
                         )

@@ -274,7 +274,7 @@ class BalanceQueue(abc.ABC):
                 )
             else:
                 log.error(
-                    "{msg}"
+                    f"{msg}"
                     "CoinTaxman requires the full transaction history to "
                     "evaluate taxation (when where these deposited coins bought?).\n"
                 )
